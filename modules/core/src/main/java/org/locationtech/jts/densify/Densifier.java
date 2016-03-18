@@ -11,6 +11,9 @@
  */
 package org.locationtech.jts.densify;
 
+import java.util.Iterator;
+import java.util.Stack;
+
 import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.geom.CoordinateList;
 import org.locationtech.jts.geom.CoordinateSequence;
@@ -59,33 +62,117 @@ public class Densifier {
 	 * @return the densified coordinate sequence
 	 */
 	private static Coordinate[] densifyPoints(Coordinate[] pts,
-			double distanceTolerance, PrecisionModel precModel) {
+			double distanceTolerance, PrecisionModel precModel, SegmentInterpolator densifier) {
 		LineSegment seg = new LineSegment();
 		CoordinateList coordList = new CoordinateList();
 		for (int i = 0; i < pts.length - 1; i++) {
 			seg.p0 = pts[i];
 			seg.p1 = pts[i + 1];
 			coordList.add(seg.p0, false);
-			double len = seg.getLength();
-			int densifiedSegCount = (int) (len / distanceTolerance) + 1;
-			if (densifiedSegCount > 1) {
-				double densifiedSegLen = len / densifiedSegCount;
-				for (int j = 1; j < densifiedSegCount; j++) {
-					double segFract = (j * densifiedSegLen) / len;
-					Coordinate p = seg.pointAlong(segFract);
-          precModel.makePrecise(p);
-					coordList.add(p, false);
-				}
+			Iterator it = densifier.densifySegment(seg, pts, i, distanceTolerance);
+			while(it.hasNext()) {
+				Coordinate p = (Coordinate) it.next();
+				precModel.makePrecise(p);
+				coordList.add(p, false);
 			}
 		}
 		coordList.add(pts[pts.length - 1], false);
 		return coordList.toCoordinateArray();
+	}
+	
+	/**
+	 * The scheme used to generate intermediate points
+	 */
+	public interface SegmentInterpolator {
+		/**
+		 * 
+		 * @param seg The current segment being interpolated
+		 * @param pts The full sequence of original points
+		 * @param i The index of the starting element of the current segment in the full sequence
+		 * @param distanceTolerance The maximum length allowable between consecutive result points
+		 * @return iterator over the intermediate points to divide the given segment
+		 */
+		Iterator densifySegment(LineSegment seg, Coordinate[] pts, int i, double distanceTolerance);
+	}
+	
+	/**
+	 * Interpolator which generates points using a function of segFract, where segFract is evenly
+	 * stepped along the length of the segment.
+	 * 
+	 * @author Kevin Smith
+	 *
+	 */
+	static abstract public class SteppingSegmentInterpolator implements SegmentInterpolator {
+		public Iterator densifySegment(final LineSegment seg, Coordinate[] pts, int i, final double distanceTolerance) {
+			return new Iterator() {
+				int j=1;
+			double len = seg.getLength();
+			int densifiedSegCount = (int) (len / distanceTolerance) + 1;
+				double densifiedSegLen = len / densifiedSegCount;
+				public boolean hasNext() {
+					return j<densifiedSegCount;
+				}
+
+				public Object next() {
+					double segFract = (j * densifiedSegLen) / len;
+					j++;
+					return pointAlong(seg, segFract);
+				}
+			};
+			}
+		public abstract Coordinate pointAlong(LineSegment seg, double segFract);
+		}
+	/**
+	 * Interpolator which generates points by dividing the segment in two and then repeating 
+	 * recursively until all the segments are under the threshold.
+	 * 
+	 * @author Kevin Smith
+	 *
+	 */
+	static abstract public class SubdividingSegmentInterpolator implements SegmentInterpolator {
+		public Iterator densifySegment(final LineSegment seg, Coordinate[] pts, int i, final double distanceTolerance) {
+			final Stack stack = new Stack();
+			stack.push(seg);
+			
+			return new Iterator() {
+				
+				public boolean hasNext() {
+					return stack.size()>1 || ((LineSegment) stack.peek()).getLength()>distanceTolerance;
+				}
+
+				public Object next() {
+					
+					LineSegment currentSeg = (LineSegment) stack.pop();
+					
+					while(currentSeg.getLength()>distanceTolerance){
+						Coordinate midpoint = midpoint(currentSeg);
+						stack.push(new LineSegment(midpoint, currentSeg.p1));
+						currentSeg.p1=midpoint;
+					}
+					
+					return currentSeg.p1;
+				}
+				
+			};
+		}
+		public abstract Coordinate midpoint(LineSegment seg);
+	}
+	
+	/**
+	 * Produces a minimal set of intermediate points evenly spaced along the segment.
+	 */
+	public static class DefaultSegmentInterpolator extends SteppingSegmentInterpolator {
+
+		public Coordinate pointAlong(LineSegment seg, double segFract) {
+			return seg.pointAlong(segFract);
+		}
 	}
 
 	private Geometry inputGeom;
 
 	private double distanceTolerance;
 
+	private SegmentInterpolator interpolator = new DefaultSegmentInterpolator();
 	/**
 	 * Creates a new densifier instance.
 	 * 
@@ -109,6 +196,18 @@ public class Densifier {
 			throw new IllegalArgumentException("Tolerance must be positive");
 		this.distanceTolerance = distanceTolerance;
 	}
+	
+	/**
+	 * Sets the interpolation scheme to use to generate new points.
+	 * 
+	 * @param distanceTolerance
+	 *          the interpolation scheme to use
+	 */
+	public void setInterpolator(SegmentInterpolator interpolator) {
+		if (interpolator==null)
+			throw new NullPointerException();
+		this.interpolator = interpolator;
+	}
 
 	/**
 	 * Gets the densified geometry.
@@ -124,7 +223,7 @@ public class Densifier {
 				CoordinateSequence coords, Geometry parent) {
 			Coordinate[] inputPts = coords.toCoordinateArray();
 			Coordinate[] newPts = Densifier
-					.densifyPoints(inputPts, distanceTolerance, parent.getPrecisionModel());
+					.densifyPoints(inputPts, distanceTolerance, parent.getPrecisionModel(), interpolator);
 			// prevent creation of invalid linestrings
 			if (parent instanceof LineString && newPts.length == 1) {
 				newPts = new Coordinate[0];
